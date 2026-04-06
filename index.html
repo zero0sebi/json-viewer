@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<!--
+  json-viewer.html  —  v1.1 (refined)
+  ════════════════════════════════════
+  A fully self-contained, offline-only JSON viewer.
+  No external network requests of any kind are made by this file.
+
+  All styles, markup, and logic are inline.
+  No CDN, no remote scripts, no remote fonts, no analytics, no tracking.
+
+  Changes in v1.1 (post-audit):
+  ─ Fixed clearStatus() / showStatus() inline-style bug that silently hid
+    error messages after a first successful parse.
+  ─ Removed dead CSS property 'spellcheck: false' (not valid CSS).
+  ─ Added MAX_DEPTH guard in flattenObject() to prevent call-stack overflow
+    on pathologically nested JSON.
+  ─ Added MAX_ROWS and MAX_COLS limits with user-visible truncation warnings.
+  ─ Added try/catch around flattenObject calls in renderArray().
+  ─ Updated inline security audit notes.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!--
+    CONTENT SECURITY POLICY
+    ───────────────────────
+    default-src 'none'          block every resource type unless overridden below
+    script-src  'unsafe-inline' allow only scripts already in this file
+    style-src   'unsafe-inline' allow only styles already in this file
+    img-src     data:           allow data: URIs; no remote images
+
+    'unsafe-inline' is required because all code is inline (single-file design).
+    Trade-off: anyone who can modify this file can run arbitrary JS.
+    Distribute the file with a published SHA-256 hash so recipients can verify
+    integrity before use (sha256sum json-viewer.html / certutil -hashfile … SHA256).
+
+    'connect-src' is covered by default-src 'none', so fetch/XHR/WebSocket
+    are blocked at the browser level even if somehow introduced.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:;">
+
+  <title>JSON Viewer — Local Only</title>
+
+  <style>
+    /* ── Design tokens ────────────────────────────────────────────────────── */
+    :root {
+      --bg:           #f4f6f8;
+      --surface:      #ffffff;
+      --border:       #d1d5db;
+      --border-light: #e5e7eb;
+      --accent:       #2563eb;
+      --accent-dark:  #1d4ed8;
+      --danger-bg:    #fef2f2;
+      --danger-bdr:   #fca5a5;
+      --danger-txt:   #b91c1c;
+      --warn-bg:      #fffbeb;
+      --warn-bdr:     #fcd34d;
+      --warn-txt:     #92400e;
+      --ok-bg:        #f0fdf4;
+      --ok-bdr:       #86efac;
+      --ok-txt:       #15803d;
+      --text:         #111827;
+      --text-muted:   #6b7280;
+      --head-bg:      #1e293b;
+      --head-fg:      #e2e8f0;
+      --head-bdr:     #334155;
+      --row-even:     #f9fafb;
+      --row-hover:    #eff6ff;
+      --null-color:   #9ca3af;
+      --bool-color:   #7c3aed;
+      --num-color:    #0369a1;
+      --arr-color:    #92400e;
+      --missing-color:#d1d5db;
+      --radius:       6px;
+      --shadow:       0 1px 4px rgba(0,0,0,.10);
+    }
+
+    /* ── Reset ────────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", Consolas,
+                   "Liberation Mono", monospace;
+      font-size: 14px;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ───────────────────────────────────────────────────────────── */
+    header {
+      background: var(--head-bg);
+      color: var(--head-fg);
+      padding: 13px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    header h1 {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: .04em;
+    }
+    .badge-offline {
+      font-size: .65rem;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      background: #16a34a;
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 99px;
+    }
+
+    /* ── Page body ────────────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    /* ── Input panel ──────────────────────────────────────────────────────── */
+    .input-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .file-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    /*
+      The real <input type="file"> is hidden.
+      The <label> acts as its visible trigger.
+      The browser controls which files are readable — no file-system path
+      is ever exposed to the page script.
+    */
+    #file-input { display: none; }
+
+    .file-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 14px;
+      border: 1.5px dashed var(--accent);
+      border-radius: var(--radius);
+      color: var(--accent);
+      font: inherit;
+      font-size: .82rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background .15s;
+      user-select: none;
+    }
+    .file-btn:hover { background: #eff6ff; }
+
+    #file-name {
+      font-size: .78rem;
+      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 280px;
+    }
+
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text-muted);
+      font-size: .75rem;
+    }
+    .divider::before,
+    .divider::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: var(--border-light);
+    }
+
+    #json-paste {
+      width: 100%;
+      min-height: 130px;
+      resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      font: inherit;
+      font-size: .82rem;
+      color: var(--text);
+      background: #fafafa;
+      outline: none;
+      transition: border-color .15s, background .15s;
+    }
+    #json-paste:focus {
+      border-color: var(--accent);
+      background: #fff;
+    }
+    #json-paste::placeholder { color: var(--text-muted); }
+
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: var(--radius);
+      padding: 8px 18px;
+      font: inherit;
+      font-size: .82rem;
+      font-weight: 700;
+      letter-spacing: .02em;
+      transition: background .13s, transform .07s;
+    }
+    button:active { transform: scale(.97); }
+
+    #btn-parse {
+      background: var(--accent);
+      color: #fff;
+    }
+    #btn-parse:hover { background: var(--accent-dark); }
+
+    #btn-clear {
+      background: var(--surface);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+    #btn-clear:hover { background: var(--bg); color: var(--text); }
+
+    .hint {
+      font-size: .72rem;
+      color: var(--text-muted);
+      align-self: center;
+    }
+
+    /* ── Status message ───────────────────────────────────────────────────── */
+    /*
+      Visibility is controlled entirely by adding/removing a CSS class.
+      No inline style is ever set on this element by JS (see showStatus /
+      clearStatus in the script section — that was a v1.0 bug).
+    */
+    #status {
+      display: none;
+      padding: 11px 15px;
+      border-radius: var(--radius);
+      font-size: .82rem;
+      line-height: 1.55;
+      word-break: break-word;
+    }
+    #status.is-error {
+      display: block;
+      background: var(--danger-bg);
+      border: 1px solid var(--danger-bdr);
+      color: var(--danger-txt);
+    }
+    #status.is-warn {
+      display: block;
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-bdr);
+      color: var(--warn-txt);
+    }
+    #status.is-ok {
+      display: block;
+      background: var(--ok-bg);
+      border: 1px solid var(--ok-bdr);
+      color: var(--ok-txt);
+    }
+
+    /* ── Output panel ─────────────────────────────────────────────────────── */
+    #output-panel { display: none; }
+
+    .meta-bar {
+      display: flex;
+      gap: 18px;
+      flex-wrap: wrap;
+      font-size: .76rem;
+      color: var(--text-muted);
+      padding: 0 2px;
+    }
+    .meta-bar b { color: var(--text); font-weight: 700; }
+
+    /*
+      The wrapper provides scrollability on both axes.
+      A finite max-height is required for position:sticky on <thead> to work —
+      sticky needs a scrolling ancestor with a defined height.
+    */
+    .table-wrap {
+      overflow: auto;
+      max-height: 68vh;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      background: var(--surface);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .8rem;
+    }
+
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--head-bg);
+      color: var(--head-fg);
+      padding: 9px 13px;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+      border-right: 1px solid var(--head-bdr);
+    }
+    thead th:last-child { border-right: none; }
+
+    .col-idx {
+      text-align: right;
+      min-width: 44px;
+      font-size: .72rem;
+      color: var(--text-muted);
+      user-select: none;
+      padding: 8px 10px;
+    }
+    thead th.col-idx {
+      color: #475569;
+      background: #0f172a;
+    }
+    tbody td.col-idx {
+      background: #f8fafc;
+      border-right: 1px solid var(--border-light);
+    }
+
+    tbody tr { background: #fff; }
+    tbody tr:nth-child(even) { background: var(--row-even); }
+    tbody tr:hover           { background: var(--row-hover); }
+
+    td {
+      padding: 7px 13px;
+      border-bottom: 1px solid var(--border-light);
+      border-right: 1px solid var(--border-light);
+      vertical-align: top;
+      max-width: 320px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    td:last-child { border-right: none; }
+
+    /* Type-aware cell colours */
+    .v-null    { color: var(--null-color); font-style: italic; }
+    .v-bool    { color: var(--bool-color); font-weight: 600; }
+    .v-number  { color: var(--num-color); }
+    .v-array   { color: var(--arr-color); font-style: italic; }
+    .v-missing { color: var(--missing-color); }
+
+    /* Non-table scalar output */
+    .scalar-out {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px 20px;
+      font-size: .82rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow: auto;
+      max-height: 60vh;
+    }
+
+    /* ── Footer ───────────────────────────────────────────────────────────── */
+    footer {
+      flex-shrink: 0;
+      text-align: center;
+      padding: 12px;
+      font-size: .7rem;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border-light);
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>JSON Viewer</h1>
+  <span class="badge-offline">offline only</span>
+</header>
+
+<main>
+
+  <section class="input-panel" aria-label="JSON input">
+
+    <!-- Input path 1: local file via FileReader API -->
+    <div class="file-row">
+      <!--
+        <input type="file"> stays hidden; the browser's native file-picker is
+        used via the <label>. The browser only exposes the filename to JS —
+        the full file-system path is never accessible to the page.
+        accept= is advisory; we validate by parsing content, not MIME type.
+      -->
+      <label class="file-btn" for="file-input">&#128194; Load JSON file</label>
+      <input type="file" id="file-input" accept=".json,application/json,text/plain">
+      <span id="file-name">No file selected</span>
+    </div>
+
+    <div class="divider">or paste below</div>
+
+    <!-- Input path 2: raw JSON text paste -->
+    <textarea
+      id="json-paste"
+      spellcheck="false"
+      autocomplete="off"
+      autocorrect="off"
+      autocapitalize="off"
+      placeholder='Paste JSON here…&#10;&#10;Examples:&#10;  Array of objects → rendered as a table&#10;  Single object    → single-row table&#10;  Array of scalars → single-column table&#10;  Any other value  → displayed as text'
+    ></textarea>
+
+    <div class="btn-row">
+      <button id="btn-parse" type="button">&#9654;&#xFE0E; Parse &amp; View</button>
+      <button id="btn-clear" type="button">&#10005; Clear</button>
+      <span class="hint">Ctrl+Enter to parse</span>
+    </div>
+  </section>
+
+  <!-- Status: error / warning / info — shown by adding a CSS class, never inline style -->
+  <div id="status" role="alert" aria-live="polite"></div>
+
+  <!-- Output panel: injected after a successful parse -->
+  <section id="output-panel" aria-label="Parsed output">
+    <div class="meta-bar" id="meta-bar"></div>
+    <div id="output-content"></div>
+  </section>
+
+</main>
+
+<footer>
+  All data stays in your browser &mdash; no network requests are made.
+</footer>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     JavaScript
+     ══════════════════════════════════════════════════════════════════════════
+     Sections:
+       1. Safety constants & element references
+       2. File-load path (FileReader API)
+       3. Parse & render entry point
+       4. Renderers: array table, scalar array, bare scalar
+       5. flattenObject — recursive flattener with depth guard
+       6. setCellContent — type-aware, textContent-only DOM writer
+       7. UI helpers (showStatus / clearStatus / setMeta / resetUI)
+       8. Pure utility functions
+       9. Inline security audit notes
+-->
+<script>
+"use strict";
+
+// ── 1. Safety constants & element references ──────────────────────────────────
+
+/*
+  MAX_INPUT_BYTES — rejects payloads before JSON.parse to prevent the main
+  thread from being blocked by a huge synchronous parse operation.
+  50 MB is generous; raise only if your datasets genuinely require it.
+*/
+const MAX_INPUT_BYTES = 50 * 1024 * 1024; // 50 MB
+
+/*
+  MAX_ROWS / MAX_COLS — prevents thousands of DOM nodes from being created
+  synchronously, which would freeze the browser tab.
+  If the data exceeds these limits the user sees a visible truncation warning
+  and still gets a useful view of the first N rows/columns.
+*/
+const MAX_ROWS = 10000;
+const MAX_COLS = 200;
+
+/*
+  MAX_DEPTH — guards against call-stack overflow inside flattenObject().
+  JSON.parse can produce objects nested thousands of levels deep.
+  Without this guard, flattenObject would keep recursing until the JS engine
+  throws a RangeError, which is not caught in the rendering path.
+  At this depth we stop recursing and store a placeholder string instead.
+*/
+const MAX_DEPTH = 20;
+
+/*
+  DANGEROUS_KEYS — prototype-pollution defence.
+  JSON.parse('{"__proto__":{"x":1}}') produces an object with a literal
+  "__proto__" own key. Spreading that into a plain {} or passing it to
+  Object.assign would silently pollute Object.prototype for every object on
+  the page. We skip these keys during flattening.
+*/
+const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+// DOM element references (read once at startup)
+const elFileInput   = document.getElementById("file-input");
+const elFileName    = document.getElementById("file-name");
+const elTextarea    = document.getElementById("json-paste");
+const elBtnParse    = document.getElementById("btn-parse");
+const elBtnClear    = document.getElementById("btn-clear");
+const elStatus      = document.getElementById("status");
+const elOutputPanel = document.getElementById("output-panel");
+const elMetaBar     = document.getElementById("meta-bar");
+const elContent     = document.getElementById("output-content");
+
+
+// ── 2. File-load path ─────────────────────────────────────────────────────────
+
+elFileInput.addEventListener("change", () => {
+  const file = elFileInput.files[0];
+  if (!file) return;
+
+  // Reject before reading to avoid allocating a huge string buffer.
+  if (file.size > MAX_INPUT_BYTES) {
+    showStatus("error",
+      `File is ${formatBytes(file.size)}, which exceeds the ` +
+      `${formatBytes(MAX_INPUT_BYTES)} limit. Split the file or raise ` +
+      `MAX_INPUT_BYTES in the source if you need larger inputs.`
+    );
+    elFileInput.value = "";
+    return;
+  }
+
+  /*
+    FileReader.readAsText() reads the file from local disk into memory as a
+    JS string. No bytes are sent over any network socket — the data stays
+    entirely within the browser process.
+  */
+  const reader = new FileReader();
+
+  reader.onload = (evt) => {
+    elTextarea.value = evt.target.result;
+    // textContent — safe even if the filename contains "<", ">", "&", etc.
+    elFileName.textContent = `${file.name} (${formatBytes(file.size)})`;
+    showStatus("ok", `Loaded \u201c${file.name}\u201d \u2014 press Parse & View.`);
+  };
+
+  reader.onerror = () => {
+    showStatus("error", "Could not read the file. Check that it is a readable text file.");
+  };
+
+  reader.readAsText(file);
+});
+
+
+// ── 3. Parse & render entry point ─────────────────────────────────────────────
+
+elBtnParse.addEventListener("click", parseAndRender);
+
+// Ctrl+Enter / Cmd+Enter shortcut inside the textarea
+elTextarea.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) parseAndRender();
+});
+
+elBtnClear.addEventListener("click", resetUI);
+
+function parseAndRender() {
+  const raw = elTextarea.value.trim();
+
+  if (!raw) {
+    showStatus("error", "Nothing to parse \u2014 paste JSON or load a file first.");
+    hideOutput();
+    return;
+  }
+
+  // Reject oversized paste inputs before calling JSON.parse.
+  // Each JS char is at most 2 bytes (UTF-16); length × 2 is a safe upper bound.
+  if (raw.length * 2 > MAX_INPUT_BYTES) {
+    showStatus("error",
+      `Input is too large (\u2248 ${formatBytes(raw.length * 2)}). ` +
+      `Limit is ${formatBytes(MAX_INPUT_BYTES)}.`
+    );
+    hideOutput();
+    return;
+  }
+
+  // Validate & parse. JSON.parse is the correct, safe approach — no eval().
+  // The native error message includes the character position, which is useful
+  // for the user: "Unexpected token } at position 42".
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    showStatus("error", "\u274C Invalid JSON \u2014 " + err.message);
+    hideOutput();
+    return;
+  }
+
+  // Clear previous status before rendering so we start from a clean state.
+  // Any truncation warnings produced during rendering will then set the
+  // status back to visible.
+  clearStatus();
+
+  // Dispatch to the renderer that matches the top-level JSON type.
+  if (Array.isArray(parsed)) {
+    renderArray(parsed);
+  } else if (parsed !== null && typeof parsed === "object") {
+    // Single object — wrap in a one-row array for a consistent table view.
+    renderArray([parsed], /*isSingleObject=*/ true);
+  } else {
+    // Bare scalar: string, number, boolean, or null.
+    renderScalar(parsed);
+  }
+}
+
+
+// ── 4. Renderers ──────────────────────────────────────────────────────────────
+
+/*
+  renderArray(arr, isSingleObject)
+  ─────────────────────────────────
+  Main renderer. Expects an array, most items of which are plain objects.
+  Non-object items are counted and skipped (reported to the user).
+  Delegates to renderScalarArray if no objects are found at all.
+*/
+function renderArray(arr, isSingleObject) {
+  const typeLabel  = isSingleObject ? "object (single-row table)" : "array";
+  const objectRows = arr.filter(isPlainObject);
+  const skipped    = arr.length - objectRows.length;
+
+  if (skipped > 0 && objectRows.length === 0) {
+    renderScalarArray(arr, typeLabel);
+    return;
+  }
+
+  // Apply row limit before flattening to avoid wasted work.
+  const rowsOverLimit = objectRows.length > MAX_ROWS;
+  const rowsToRender  = rowsOverLimit ? objectRows.slice(0, MAX_ROWS) : objectRows;
+
+  // Flatten: nested objects become dot-notation keys.
+  // Wrapped in try/catch as a safety net — the depth guard in flattenObject
+  // should prevent stack overflows, but an unexpected engine limit would
+  // otherwise produce an unhandled RangeError.
+  let flatRows;
+  try {
+    flatRows = rowsToRender.map((row) => flattenObject(row));
+  } catch (err) {
+    showStatus("error", "Failed to flatten JSON structure: " + err.message);
+    hideOutput();
+    return;
+  }
+
+  // Infer columns from all flattened rows (insertion-order preserved via Set).
+  const allColumns    = inferColumns(flatRows);
+  const colsOverLimit = allColumns.length > MAX_COLS;
+  const columns       = colsOverLimit ? allColumns.slice(0, MAX_COLS) : allColumns;
+
+  // Build a combined warning if any limits were hit.
+  const warnings = [];
+  if (skipped > 0) {
+    warnings.push(
+      `${skipped} non-object row${skipped > 1 ? "s" : ""} skipped`
+    );
+  }
+  if (rowsOverLimit) {
+    warnings.push(
+      `rows truncated to ${MAX_ROWS.toLocaleString()} of ` +
+      `${objectRows.length.toLocaleString()}`
+    );
+  }
+  if (colsOverLimit) {
+    warnings.push(
+      `columns truncated to ${MAX_COLS} of ${allColumns.length}`
+    );
+  }
+  if (warnings.length > 0) {
+    showStatus("warn", "\u26A0\uFE0F " + warnings.join("; ") + ".");
+  }
+
+  setMeta([
+    { label: "type",    value: typeLabel },
+    {
+      label: "rows",
+      value: rowsOverLimit
+        ? `${MAX_ROWS.toLocaleString()} of ${objectRows.length.toLocaleString()}`
+        : flatRows.length.toLocaleString(),
+    },
+    {
+      label: "columns",
+      value: colsOverLimit
+        ? `${MAX_COLS} of ${allColumns.length}`
+        : columns.length,
+    },
+  ]);
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "table-wrap";
+  wrapper.appendChild(buildTable(flatRows, columns));
+
+  elContent.innerHTML = "";
+  elContent.appendChild(wrapper);
+  showOutput();
+}
+
+/*
+  renderScalarArray(arr, typeLabel)
+  ──────────────────────────────────
+  For arrays whose items are scalars rather than objects (e.g. ["a", 1, null]).
+  Renders a single-column "value" table.
+*/
+function renderScalarArray(arr, typeLabel) {
+  const overLimit    = arr.length > MAX_ROWS;
+  const itemsToShow  = overLimit ? arr.slice(0, MAX_ROWS) : arr;
+
+  if (overLimit) {
+    showStatus("warn",
+      `\u26A0\uFE0F Items truncated to ${MAX_ROWS.toLocaleString()} of ` +
+      `${arr.length.toLocaleString()}.`
+    );
+  }
+
+  setMeta([
+    { label: "type",    value: typeLabel || "array" },
+    {
+      label: "items",
+      value: overLimit
+        ? `${MAX_ROWS.toLocaleString()} of ${arr.length.toLocaleString()}`
+        : arr.length.toLocaleString(),
+    },
+    { label: "columns", value: 1 },
+  ]);
+
+  // Wrap each scalar in a synthetic {value: …} so buildTable can handle it.
+  const fakeRows = itemsToShow.map((v) => ({ value: v }));
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "table-wrap";
+  wrapper.appendChild(buildTable(fakeRows, ["value"]));
+
+  elContent.innerHTML = "";
+  elContent.appendChild(wrapper);
+  showOutput();
+}
+
+/*
+  renderScalar(value)
+  ────────────────────
+  For a top-level primitive (string, number, boolean, null).
+  Renders as preformatted text — no table needed.
+*/
+function renderScalar(value) {
+  setMeta([{ label: "type", value: typeof value }]);
+
+  const pre = document.createElement("pre");
+  pre.className = "scalar-out";
+  pre.textContent = String(value); // textContent — safe regardless of content
+  elContent.innerHTML = "";
+  elContent.appendChild(pre);
+  showOutput();
+}
+
+/*
+  buildTable(flatRows, columns) → HTMLTableElement
+  ─────────────────────────────────────────────────
+  Creates the full table DOM tree from pre-flattened rows and a column list.
+
+  SECURITY: all text is inserted via .textContent, never .innerHTML.
+  A JSON value containing HTML tags is stored as plain text in the DOM
+  and displayed literally -- it is never parsed as markup.
+*/
+function buildTable(flatRows, columns) {
+  const table = document.createElement("table");
+
+  // ── thead ──────────────────────────────────────────────────────────────
+  const thead = document.createElement("thead");
+  const hrow  = document.createElement("tr");
+
+  const idxTh = document.createElement("th");
+  idxTh.className   = "col-idx";
+  idxTh.textContent = "#";
+  hrow.appendChild(idxTh);
+
+  for (const col of columns) {
+    const th = document.createElement("th");
+    th.textContent = col; // col is a string key from flattenObject — textContent is safe
+    th.title       = col; // tooltip useful when header is truncated by overflow
+    hrow.appendChild(th);
+  }
+
+  thead.appendChild(hrow);
+  table.appendChild(thead);
+
+  // ── tbody ──────────────────────────────────────────────────────────────
+  const tbody = document.createElement("tbody");
+
+  for (let i = 0; i < flatRows.length; i++) {
+    const row = flatRows[i];
+    const tr  = document.createElement("tr");
+
+    const idxTd = document.createElement("td");
+    idxTd.className   = "col-idx";
+    idxTd.textContent = i + 1;
+    tr.appendChild(idxTd);
+
+    for (const col of columns) {
+      const td = document.createElement("td");
+
+      /*
+        Use Object.prototype.hasOwnProperty.call rather than row.hasOwnProperty
+        so that a JSON key literally named "hasOwnProperty" cannot shadow the
+        method and produce incorrect results.
+      */
+      if (!Object.prototype.hasOwnProperty.call(row, col)) {
+        td.className   = "v-missing";
+        td.textContent = "\u2014"; // em dash: column absent in this row
+        td.title       = "column not present in this row";
+      } else {
+        setCellContent(td, row[col]);
+      }
+
+      tr.appendChild(td);
+    }
+
+    tbody.appendChild(tr);
+  }
+
+  table.appendChild(tbody);
+  return table;
+}
+
+
+// ── 5. flattenObject ──────────────────────────────────────────────────────────
+
+/*
+  flattenObject(obj, prefix, depth) → plain object with dot-notation keys
+  ─────────────────────────────────────────────────────────────────────────
+  Recursively collapses nested objects into a single level:
+    {a: {b: {c: 1}}}   →  {"a.b.c": 1}
+    {x: [1, 2, 3]}     →  {"x": [1,2,3]}   (arrays NOT recursed — stored as-is)
+
+  depth guard: stops recursing at MAX_DEPTH and stores a placeholder string
+  so deeply nested input cannot overflow the JS call stack.
+
+  prototype-pollution guard: skips any key in DANGEROUS_KEYS.
+*/
+function flattenObject(obj, prefix, depth) {
+  if (prefix === undefined) prefix = "";
+  if (depth  === undefined) depth  = 0;
+
+  const result = {};
+
+  for (const key of Object.keys(obj)) {
+    // Skip keys that would pollute Object.prototype if assigned elsewhere.
+    if (DANGEROUS_KEYS.has(key)) continue;
+
+    const fullKey = prefix ? prefix + "." + key : key;
+    const val     = obj[key];
+
+    if (isPlainObject(val)) {
+      if (depth + 1 >= MAX_DEPTH) {
+        // Depth limit reached — represent the nested object as a placeholder
+        // rather than recursing further. This prevents call-stack overflow.
+        result[fullKey] = "\u22EF [object, depth \u2265 " + MAX_DEPTH + "]";
+      } else {
+        // Recurse. Object.assign avoids creating extra intermediate objects
+        // compared to spread syntax in hot loops over large data sets.
+        Object.assign(result, flattenObject(val, fullKey, depth + 1));
+      }
+    } else {
+      result[fullKey] = val;
+    }
+  }
+
+  return result;
+}
+
+
+// ── 6. setCellContent ─────────────────────────────────────────────────────────
+
+/*
+  setCellContent(td, value)
+  ──────────────────────────
+  Writes a JSON value into a <td> with type-aware CSS class colouring.
+
+  SECURITY: every write uses .textContent, never .innerHTML.
+  This holds for every branch — strings, numbers, booleans, null, arrays.
+  A string value containing HTML characters is rendered as literal text;
+  the browser never parses it as markup.
+*/
+function setCellContent(td, value) {
+  if (value === null) {
+    td.className   = "v-null";
+    td.textContent = "null";
+    td.title       = "null";
+
+  } else if (typeof value === "boolean") {
+    td.className   = "v-bool";
+    td.textContent = String(value); // "true" or "false"
+
+  } else if (typeof value === "number") {
+    td.className   = "v-number";
+    td.textContent = String(value);
+
+  } else if (Array.isArray(value)) {
+    td.className   = "v-array";
+    // Compact inline preview; full JSON in the tooltip.
+    td.textContent = compactPreview(value, 80);
+    // .title is automatically HTML-attribute-encoded by the browser; no risk.
+    td.title = JSON.stringify(value, null, 2);
+
+  } else {
+    // String — most common case, highest XSS risk if mishandled.
+    td.textContent = value; // safe: textContent
+    if (value.length > 60) td.title = value; // full value in tooltip when clipped
+  }
+}
+
+
+// ── 7. UI helpers ─────────────────────────────────────────────────────────────
+
+/*
+  showStatus / clearStatus
+  ────────────────────────
+  Visibility is driven purely by CSS class, never by inline style.
+
+  v1.0 bug (fixed): clearStatus() was setting elStatus.style.display = "none"
+  as an inline style. When showStatus() was later called it added a CSS class
+  whose 'display: block' rule was silently overridden by the more-specific
+  inline style, making the status element invisible. Fixed by removing all
+  inline style manipulation — the CSS class alone is sufficient.
+*/
+function showStatus(type, text) {
+  // Map type → CSS class. "warn" gets its own amber style distinct from error.
+  const classMap = { error: "is-error", warn: "is-warn", ok: "is-ok" };
+  elStatus.className   = classMap[type] || "is-ok";
+  elStatus.textContent = text; // textContent — safe for any string content
+}
+
+function clearStatus() {
+  // Removing the class returns the element to CSS default: display:none.
+  // No inline style is set here.
+  elStatus.className   = "";
+  elStatus.textContent = "";
+}
+
+function showOutput() {
+  elOutputPanel.style.display = "block";
+}
+
+function hideOutput() {
+  elOutputPanel.style.display = "none";
+  elContent.innerHTML = "";  // safe: clearing, not writing user data
+  elMetaBar.innerHTML = "";  // safe: same
+}
+
+/*
+  setMeta(items)
+  ───────────────
+  Renders the metadata bar (type, row count, column count).
+  Built entirely via createElement + textContent — no innerHTML with data.
+  item.label values are code-controlled strings, not user data.
+*/
+function setMeta(items) {
+  elMetaBar.innerHTML = ""; // safe: immediately rebuilt with DOM API calls
+
+  for (const item of items) {
+    const span  = document.createElement("span");
+    const label = document.createTextNode(item.label + ": ");
+    const bold  = document.createElement("b");
+    bold.textContent = String(item.value); // could be a number or a string
+    span.appendChild(label);
+    span.appendChild(bold);
+    elMetaBar.appendChild(span);
+  }
+}
+
+function resetUI() {
+  elTextarea.value       = "";
+  elFileInput.value      = "";
+  elFileName.textContent = "No file selected";
+  clearStatus();
+  hideOutput();
+}
+
+
+// ── 8. Utility functions ──────────────────────────────────────────────────────
+
+/*
+  inferColumns(flatRows) → string[]
+  ──────────────────────────────────
+  Scans all rows to collect every key that appears in any of them.
+  A Set preserves insertion order (ES2015+), so columns appear in the order
+  they were first encountered when reading rows left to right.
+*/
+function inferColumns(flatRows) {
+  const seen = new Set();
+  for (const row of flatRows) {
+    for (const key of Object.keys(row)) seen.add(key);
+  }
+  return [...seen];
+}
+
+/*
+  isPlainObject(val) → boolean
+  ─────────────────────────────
+  Returns true only for non-null, non-array plain objects
+  (i.e. {} literals and the objects produced by JSON.parse).
+  Rejects Date, RegExp, Map, Set, and other host objects.
+*/
+function isPlainObject(val) {
+  return (
+    val !== null &&
+    typeof val === "object" &&
+    !Array.isArray(val) &&
+    Object.getPrototypeOf(val) === Object.prototype
+  );
+}
+
+/*
+  compactPreview(arr, maxLen) → string
+  ─────────────────────────────────────
+  Short inline summary of an array value for display in a table cell.
+  Truncates with "…]" when the full JSON exceeds maxLen characters.
+*/
+function compactPreview(arr, maxLen) {
+  const full = JSON.stringify(arr);
+  if (full.length <= maxLen) return full;
+  return full.slice(0, maxLen - 3) + "\u2026]";
+}
+
+/*
+  formatBytes(n) → string
+  ────────────────────────
+  Human-readable size label for status messages and error text.
+*/
+function formatBytes(n) {
+  if (n < 1024)     return n + " B";
+  if (n < 1048576)  return (n / 1024).toFixed(1) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+
+// ── 9. Inline security audit notes ───────────────────────────────────────────
+/*
+  ══════════════════════════════════════════════════════════════════════════════
+  SECURITY PROPERTIES  (v1.1)
+  ══════════════════════════════════════════════════════════════════════════════
+
+  A. NO NETWORK SURFACE
+     ─ No fetch(), XMLHttpRequest, WebSocket, EventSource, sendBeacon().
+     ─ No <script src>, <link href>, <img src> with any remote URL.
+     ─ No dynamic import() or importScripts().
+     ─ CSP meta enforces this at the browser level via default-src 'none'.
+       connect-src falls back to default-src 'none', blocking all outbound
+       connections even if code were injected.
+
+  B. NO REMOTE RESOURCES
+     ─ All CSS is inline. No @import, no url() referencing any remote asset.
+     ─ Font stack uses local system fonts only (ui-monospace, Consolas, …).
+     ─ No analytics, no tracking pixels, no third-party libraries.
+
+  C. XSS PREVENTION
+     ─ Every user-controlled value (JSON keys, JSON values, filenames, error
+       strings) reaches the DOM exclusively via .textContent or
+       document.createTextNode(). Never via .innerHTML or
+       insertAdjacentHTML().
+     ─ .innerHTML = "" is used only to empty containers before rebuilding
+       them — no user data flows through it.
+     ─ .title attributes (tooltips) are HTML-attribute-encoded automatically
+       by the browser; no injection risk.
+
+  D. PROTOTYPE POLLUTION
+     ─ flattenObject() skips DANGEROUS_KEYS before any Object.assign call.
+     ─ hasOwnProperty accessed as Object.prototype.hasOwnProperty.call()
+       so a key literally named "hasOwnProperty" cannot shadow the method.
+
+  E. CALL-STACK / DoS PROTECTION
+     ─ File size checked against MAX_INPUT_BYTES before FileReader allocates.
+     ─ Pasted text byte-estimate checked before JSON.parse is called.
+     ─ flattenObject() stops recursing at MAX_DEPTH; stores a placeholder
+       string rather than overflowing the call stack.
+     ─ renderArray() truncates to MAX_ROWS rows and MAX_COLS columns;
+       both limits are shown to the user as visible warnings.
+     ─ renderArray() wraps flattenObject calls in try/catch as a safety net.
+
+  F. CODE EXECUTION
+     ─ JSON.parse is used exclusively. eval(), new Function(), and
+       setTimeout/setInterval with string arguments are absent.
+
+  G. FILE PATH CONFIDENTIALITY
+     ─ FileReader exposes only file.name (basename), never the full path.
+     ─ file.name is rendered via textContent, not innerHTML.
+
+  H. 'unsafe-inline' TRADE-OFF
+     ─ Necessary for a single-file tool; accepted and documented.
+     ─ Implication: file integrity must be controlled out-of-band (SHA-256).
+     ─ For server-hosted use, replace the <meta> CSP with an HTTP header and
+       switch from 'unsafe-inline' to a per-script 'nonce-…' value.
+  ══════════════════════════════════════════════════════════════════════════════
+*/
+</script>
+
+</body>
+</html>
